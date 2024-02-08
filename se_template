@@ -1,7 +1,7 @@
 ****************************************************************************************************
 *
 * Program Name      : se_template.sas
-* Protocol / Study  : GBT\GBT21601\GBT21601-021\PartA_Final
+* Protocol / Study  : 
 * Type              : SDTM dataset
 * Description       : Production of SE
 *
@@ -10,7 +10,7 @@
 * Date Created      : 10MAY2023
 * Input Dataset     : RAW: DS_IC, SD, SD_1, SD_EOS, DS_EOT
                       SDTM: DM, TA
-* Macros Used       : %prod_attributes, %checklog
+* Macros Used       : %prod_attributes
 * Files Used        : 
 * Status:           : in progress
 ****************************************************************************************************

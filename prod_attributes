@@ -1,0 +1,94 @@
+********************************************************************************************************************************************************************
+*
+* Program Name     : prod_attributes.sas
+* Protocol/ Study  : 
+* Type             : Utility
+* Description      : The macro uses the specification file of the domain of interest to automatically assign labels, lengths
+                     and to position the variable in the order they appear in the spec
+*                    
+* Author           : Hayk Hovhannisyan
+* 
+* Date Created     : 26May2023
+*
+********************************************************************************************************************************************************************
+* Change history   : #
+* Changed by       :        
+* Reason for change: 
+*                    
+* Date changed     :         
+********************************************************************************************************************************************************************
+* Parameters: domain       - The two letter domain abbreviation
+*             datain       - The name of the input dataset to apply variable attributes to
+*             dataout      - The name of the output dataset which has the attributes applied
+*
+* Example of Usage:     %prod_attributes(domain = DM, datain = dm03, dataout = dm04);
+*             
+********************************************************************************************************************************************************************;
+
+%macro prod_attributes(domain=,datain=,dataout=);
+
+%* Importing the spec of the dataset of interest to have accees to the metadata about 
+   variable names and labels ;
+
+proc import datafile = "&sdtm_specs.\&domain..xlsx"
+    out = &domain.spec01
+	dbms = xlsx
+	replace;
+	getnames = no;
+    datarow = 3;
+run;
+
+%* The variable name and label values are concatenated to have a form of an assignment statements
+   so that they can be referenced later in a LABEL statement. ;
+
+data &domain.spec02;
+  length NAME_LABEL NAME_LENGTH NAME_SWAP $200.;
+    set &domain.spec01(keep = A B C D where = (A is not missing));
+	   NAME_LABEL = catx(" = ", A, quote(strip(B)));
+	   
+	   if upcase(C) = "TEXT" then NAME_LENGTH = strip(A)||" $"||strip(cats(D))||".";
+	     else if upcase(C) = "INTEGER" then NAME_LENGTH = strip(A)||" 8.";
+		 else if find(upcase(C),"DATE") and missing(D) then NAME_LENGTH = strip(A)||" $19.";
+
+	   NAME_SWAP = catx(" = ", A, cats("temp_",A)); 
+run;
+
+%* Using and SQL query to generate two thing:
+   1) A list of all variable/laabel pairings in a list in a macro variable.
+   2) A list of all variables that need to be kept in the final dataset. ;
+
+%global name_label;
+%global name_length;
+%global keepvars;
+
+proc sql noprint;
+    select NAME_LABEL into: name_label separated by " " from &domain.spec02;
+	select NAME_LENGTH into: name_length separated by " " from &domain.spec02;
+	select NAME_SWAP into: name_swap separated by " " from &domain.spec02;
+    select A into : keepvars separated by " " from &domain.spec02;
+quit;
+
+%put &=name_label;
+%put &=name_length;
+%put &=name_swap;
+%put &=keepvars;
+
+%* Applying the macro variable defined above to:
+   1) assing labels
+   2) define Order of variables
+   3) keep variables;
+
+%local each_name;
+
+data &dataout;
+ length &name_length;
+    set &datain(rename = (&name_swap));
+	   %do i = 1 %to %sysfunc(countw(&keepvars,%str( )));
+          %let each_name = %scan(&keepvars,&i.,%str( ));
+          &each_name. = temp_&each_name.;
+	   %end;
+       label &name_label;
+	keep &keepvars;
+run;
+
+%mend prod_attributes;

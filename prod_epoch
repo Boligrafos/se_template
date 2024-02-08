@@ -1,0 +1,341 @@
+********************************************************************************************************************************************************************
+*
+* Program Name     : prod_epoch.sas
+* Protocol/ Study  : 
+* Type             : Utility
+* Description      : The macro assigns EPOCH values based on date correspondence between domain and SE dates.
+*                    
+* Author           : Hayk Hovhannisyan
+* 
+* Date Created     : 01Jun2023
+*
+********************************************************************************************************************************************************************
+* Change history   : #
+* Changed by       :        
+* Reason for change: 
+*                    
+* Date changed     :         
+********************************************************************************************************************************************************************
+* Parameters: datain       - The name of the input dataset to appy variable labels to
+*             dtc          - The datetime of measurement/exposure/event
+*             dataout      - The name of the output dataset which has the labels applied
+*
+* Example of Usage:     %prod_epoch(datain = vs01, dtc = vsdtc, dataout = vs02);
+*             
+********************************************************************************************************************************************************************;
+
+%macro prod_epoch(datain=, dtc=, dataout=);
+
+%* SDTM.SE dataset is the fundamental dataset to assign EPOCH values for the rest of the domains.
+   The SESTDTC and SEENDTC variable values are going to act as date boundaries to determine which
+   element from SE corresponds to the records in the input dataset.
+
+   Several actions are taken to prepare SE for further processing.
+
+   1) The variables USUBJID and EPOCH are renamed. This is done as a PROC SQL step is used later 
+      in the program to join SE with the input domain and since the two variables already exist
+      in the input dataset then renaming them helps to avoid PROC SQL error related to selection 
+      of the same variable twice. 
+
+   2) The variables STUDYID, DOMAIN are dropped for the above mentioned reason. 
+
+   3) The SESTDTC and SEENDTC values need to be compared against the --DTC values from the input
+      dataset to determine the element/epoch range in which an observation from the input 
+      dataset falls. The comparion will be done more easily if the dates are of numeric type. 
+      Since the values could be either date or datetime all values are converted into datetimes. ;
+
+data se01;
+  set sdtm.se;
+
+  %* 1) ;
+  rename usubjid = sesubjid
+         epoch = seepoch;
+
+  %* 2) ;
+  drop studyid domain;
+
+  %* 3) ;
+  if find(sestdtc, "T") then sestdtn = input(sestdtc, is8601dt.);
+    else if lengthn(sestdtc) = 10 then sestdtn = input(sestdtc, is8601da.)*(24*3600);
+
+  if find(seendtc, "T") then seendtn = input(seendtc, is8601dt.);
+    else if lengthn(seendtc) = 10 then seendtn = input(seendtc, is8601da.)*(24*3600);
+run;
+
+%* A few actions are taken to prepare the input dataset for further processing.
+
+   1) A cautionary step to check if there is an existing EPOCH variable in the input data
+      and set it to missing.
+
+   2) On several occsions, the value of VISITNUM is going to be a determining factor in the
+      assignment of EPOCH, so a cautionary step is taken to define a VISITNUM variable in 
+      case the input dataset does not have it to ensure smooth run of pieces of code that
+      contain reference to VISITNUM.
+
+   3) Just like done for SE, the --DTC values are converted to numeric datetime values. 
+
+   4) It is important to keep trace of the original sequence of observations in the input 
+      dataset. The values of the automatic _N_ variable are assigned to a new var named TEMPSEQ. ;
+   
+data main01;
+  set &datain.;
+
+  %* 1) ;
+  if epoch = "" then epoch = epoch;
+  call missing(epoch);
+
+  %* 2) ;
+  if visitnum = . then visitnum = visitnum;
+
+  %* 3) ;
+  if find(&dtc, "T") then dtn = input(&dtc, is8601dt.); 
+    else if lengthn(&dtc) = 10 then dtn = input(&dtc, is8601da.)*(24*3600);
+
+  %* 4) ;
+  tempseq = _n_;
+run;
+
+%* --DTC values in the input domain which occurred earlier than the informed consent date
+   (such as pre-study medication) can not be assigned any EPOCH values. It is important to 
+   flag such records and dismiss them from further derivations. 
+
+   1) The input data is merged with SDTM.DM.
+
+   2) RFICDTC values are converted to numeric datetime values. 
+
+   3) Pre-consent values are flagged with the BEFORE_CONSENT variable. ;
+
+proc sort data = main01; by usubjid; run;
+
+%* 1) ;
+data main02;
+  merge main01(in=a) sdtm.dm(in=b keep = usubjid rficdtc armnrs);
+  by usubjid;
+  if a and b;
+run;
+
+data main03;
+  set main02;
+
+  %* 2) ;
+  if not missing(rficdtc) then rficdtn = input(rficdtc, is8601da.)*(24*3600);
+
+  %* 3) ;
+  if nmiss(dtn, rficdtn) = 0 then do;
+    if dtn < rficdtn then before_consent = "Y";
+  end;
+run;
+
+
+%* Now that both SE and the input dataset are prepared they can be joined. 
+   This is a one-to-many join and USUBJID is the only variable to be used as the key for join. 
+   The intention is that for each record in the input dataset there should be generated as many
+   new records as there are elements in SE per subject. The records when --DTC is missing or are 
+   flageed as pre-consent are of no interest to us as there is no way to determine EPOCH for such
+   values anyways. These missing records are removed from the jon. So at the end it is number of 
+   non-missing, >= consent datetime records in input data times number of records in SE. ;
+
+proc sql noprint;
+  create table hepoch01 as
+  select a.*, b.*
+  from (select * from main03 where not (dtn is null or before_consent = "Y")) a 
+  left join se01 b
+  on a.usubjid = b.sesubjid
+  order by usubjid, tempseq, seseq;
+quit;
+
+%* The following data step is dedicated to the comparison of the datetime values from the input
+   data against the start and end datetime values from SE. The code consists of several blocks of
+   conditional logic. The order in which the conditional blocks appear is on purpose.  
+
+   1) The first block represents the most common case when both the start point and the end point
+      of a datetime range are not missing when the element is TREATMENT and the --DTC is between
+      this range inclusively. A temporary variable named EP_SCALE is used to keep track of the 
+      records who meet the condition. EP_SCALE is assigned sequential numbers per conditon.
+      The smaller the value of EP_SCALE the more priority the SE.EPOCH value corresponding to that 
+      scale gets. 
+
+   2) Next is a case when --DTC has both date and time parts, SEENDTC of the TREATMENT element
+      only has date part. While the date parts of --DTC and SEENDTC are equal, the time part of --DTC
+      raises a question of whether the record should be considered to have happened during the
+      TREATMENT or FOLLOW-UP epoch. VISITNUM is used as a determining factor in this case. If the
+      record is of treatment visit then EPOCH should be favoured to the side of TREATMENT. 
+      Otherwise EPOCH will be assigned as FOLLOW-UP with the next conditional steps. EP_SCALE is 
+      assigned the value of 2 accordingly. 
+
+   3) The second block represents the case when both the start point and the end point of a 
+      datetime range are not missing for the non-TREATMENT elements and the --DTC is between this 
+      range with start boundary being inclusive and the end boundary being exclusive. EP_SCALE is
+      assigned the value of 3 accordingly. 
+
+   4) The third block represents the case when the end point of element is missing. Here only the
+      start point of element is getting compared against the input --DTC. 
+
+   5) Special case when start and end points of Screening element are equal. 
+      In this case only the start point is compared against --DTC. 
+
+   6) Special case when the start point of Follow-up is equal to --DTC
+      and the end of Follow-up is missing.
+      
+   7) Special case when the subject is either a scren failure or has not been assigned/treated yet.
+      The end of Screening element is most likely the date of becoming failure or another disposition
+      event that happened within the Screening element. For such cases, the date of the input dataset
+      is compared againsed the start and end points of the Screening element inclusively.
+
+   8) Case when both start and end points of Follow-up are available. In this case the date from 
+      the input dataset needs to be compared against the element beginning exclusively and 
+      element end exclusively.
+
+   9) Case when date from the input data set has both date part and time part while the end point of 
+      FOLLOW-UP only has date part. --DTC, appears to be later than SEENDTC due to the time part, but
+      since the date parts are equal EPOCH is considered to be FOLLOW-UP. 
+
+   100) Special case when, due to the study being ongoing, the full list of elements is not available
+        per subject. This mostly happens when the subject has not reached the 'end of treatment' in
+        the study, but neither has all the occurrences of study drug administration collected. In such 
+        cases dates in our database which occur later than SEENDTC of the last element are to be left
+        with blank EPOCH values until SE is improved with future data transfers. In order to separate
+        (make unique) such recods from the rest, EP_SCALE is the sum of [a relatively large number of 100,
+        0.1 to turn it into a non-integer number, TAETORD to distinguish between elements within the same
+        TEMPSEQ]. 
+
+   999) If none of the above conditions are satisfied the record is flagged as 999 so it can be 
+        investigated by the programmer. If necessary, new conditional blocks are to be added for 
+        specific cases of such records. 
+
+   The reason that EP_SCALE is assigned different scale values per condition is because --DTC from 
+   input data may satisfy multiple considitions. And the scale helps to pick the option that has 
+   priority over the others. The records with higher priority are sorted in the next step in the
+   program. ;
+
+data hepoch02;
+  set hepoch01;
+
+  /* 1 */
+  if nmiss(sestdtn, seendtn, dtn) = 0 then do;
+    if taetord = 2 and sestdtn <= dtn <= seendtn then ep_scale = 1;
+  end;
+
+  /* 2 */
+  if nmiss(seendtn, dtn) = 0 then do;
+    if taetord = 2 and not find(seendtc,"T") and datepart(seendtn) = datepart(dtn) 
+       and visitnum in (101:110) and missing(ep_scale) then ep_scale = 2;
+  end;
+
+  /* 3 */
+  if nmiss(sestdtn, seendtn, dtn) = 0 then do;
+    if taetord ^= 2 and sestdtn <= dtn < seendtn then ep_scale = 3;
+  end;
+
+  /* 4 */
+  if nmiss(sestdtn, dtn) = 0 and missing(seendtn) then do;
+    if sestdtn <= dtn and missing(ep_scale) then ep_scale = 4;
+  end;
+
+  /* 5 */
+  if taetord = 1 and nmiss(sestdtn, seendtn, dtn) = 0 then do;
+    if sestdtn = seendtn and sestdtn <= dtn then ep_scale = 5;
+  end;
+
+  /* 6 */
+  if taetord = 3 and nmiss(sestdtn, dtn) = 0 then do;
+    if datepart(sestdtn) = datepart(dtn) and missing(ep_scale) then ep_scale = 6;
+  end;
+
+  /* 7 */
+  if not missing(armnrs) and taetord = 1 and nmiss(sestdtn, seendtn, dtn) = 0 then do;
+    if sestdtn <= dtn <= seendtn and missing(ep_scale) then ep_scale = 7;
+  end;
+
+  /* 8 */
+  if taetord = 3 and nmiss(sestdtn, seendtn, dtn) = 0 then do;
+    if sestdtn < dtn <= seendtn and missing(ep_scale) then ep_scale = 8;
+  end;
+
+  /* 9 */
+  if taetord = 3 and nmiss(seendtn, dtn) = 0 then do;
+    if dtn > seendtn and datepart(dtn) = datepart(seendtn) and missing(ep_scale) then ep_scale = 9;
+  end;
+
+  /* 100 */
+  if nmiss(sestdtn, seendtn) < 2 and not missing(dtn) then do;
+    if dtn > coalesce(seendtn, sestdtn) and missing(ep_scale) then ep_scale = taetord + 100.1;
+  end;
+
+  /* 999 */
+  if missing(ep_scale) then ep_scale = 999;
+run;
+
+%* The following SQL step reatains the value with the smallest scale for the rest of the records
+   per subject and per original sequence id;
+
+proc sql noprint;
+  create table hepoch03 as
+  select *, min(ep_scale) as min_ep_scale 
+  from hepoch02
+  group by usubjid, tempseq
+  order by usubjid, tempseq, seseq;
+quit;
+
+%* The next SQL step filters out observations for which none of the EPOCH conditional logic blocks worked.;
+
+proc sql noprint;
+  create table no_epoch as 
+  select distinct usubjid, tempseq, min_ep_scale
+  from hepoch03
+  where min_ep_scale = 999;
+quit;
+
+%* The problematic records are put in the log to warn the programmer to investigate. ;
+
+data _null_;
+  set no_epoch;
+  if min_ep_scale = 999 then do;
+    put 'WARNING: records for which none of the SE elements match need to be investigated. The conditional logic in the HEPOCH02 data step may need amendments. ~' usubjid= tempseq= ;
+  end;
+run;
+
+%* This is the step where the records with the correct EPOCH values are filtered out.
+   In order to do this the records where the smallest epoch scale is equal to the 
+   epoch scale are chosen.
+ 
+   1) For integer scales (scales corresponding to either of the first four conditions 
+   in the HEPOCH02 data step) the EPOCH variable is assigned the values of SEEPOCH.
+
+   2) The non-integer scales (scales corresponding to the fifth condition in the
+   the HEPOCH02 data step) the EPOCH is set to blank. 
+
+   The output data set represents the final EPOCH assignments. ;
+
+data hepoch04;
+  set hepoch03;
+  if ep_scale = min_ep_scale then do;
+    /* 1 */
+    if int(ep_scale) = ep_scale and not missing(seepoch) then epoch = seepoch;
+	  /* 2 */
+	  else epoch = "";
+	output;
+  end;
+run;
+
+%* We need to keep in mind that the missing --DTC records and dates earlier than informed consent were
+   left out of processing earlier in the program. Now it is time to combine these records back with the
+   non-missing records. ;
+
+data hepoch05;
+  set hepoch04 main03(where = (dtn is missing or before_consent = "Y"));
+run;
+
+%* Sorting the data by the original sequence of observations. ;
+
+proc sort data = hepoch05;
+  by usubjid tempseq;
+run;
+
+%* Outputing the final results and dropping all the temporary variables that were created earlier in the program. ;
+
+data &dataout.;
+  set hepoch05(drop = dtn -- min_ep_scale);
+run;
+
+%mend prod_epoch;

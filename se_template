@@ -1,0 +1,276 @@
+****************************************************************************************************
+*
+* Program Name      : se_template.sas
+* Protocol / Study  : GBT\GBT21601\GBT21601-021\PartA_Final
+* Type              : SDTM dataset
+* Description       : Production of SE
+*
+* Author            : Hayk Hovhannisyan
+*
+* Date Created      : 10MAY2023
+* Input Dataset     : RAW: DS_IC, SD, SD_1, SD_EOS, DS_EOT
+                      SDTM: DM, TA
+* Macros Used       : %prod_attributes, %checklog
+* Files Used        : 
+* Status:           : in progress
+****************************************************************************************************
+* Change History
+* Changed By        :
+* Reason for Change :
+* Date Changed      :
+****************************************************************************************************;
+
+/*******************************************
+                SCREENING
+*******************************************/
+
+/* The DS_IC raw dataset is processed to pick the earliest of consent dates. 
+   The retrieved date will become the start of the Screenig element. Subjects 
+   who have not signed an informed consent are removed from further processing 
+   and will not appear in SE. */
+
+data screen01;
+  set raw.ds_ic(keep = subjid formeid suppds_qval_repeat ds_dsstdat_consent);
+  where not missing(ds_dsstdat_consent); 
+run;
+
+proc sort data = screen01;
+  by subjid ds_dsstdat_consent;
+run;
+
+data screen02;
+  set screen01;
+  by subjid ds_dsstdat_consent;
+  if first.subjid then do;
+    date_of_screening = input(ds_dsstdat_consent, ??is8601da.);
+	output;
+  end;
+
+  format date_of_screening date9.;
+run;
+
+* Data processing for the Screening element is finished with the above steps. ;
+
+
+/**************************************************************************************************************
+                                          Treatment Elements
+
+Part A - "GBT021601-021 100mg 12 weeks", "GBT021601-021 150mg 12 weeks", "GBT021601-021 up to 200mg 12 weeks"
+Part B - "GBT021601-021 TBD mg", "Placebo"
+Part C - "Cohort 1", "Cohort 2", "Cohort 3", "Cohort 4"
+**************************************************************************************************************/
+
+/* Data for study drug administration was collected in three different raw datasets. 
+
+   1) SD raw dataset has in-clininc and home administration dates. The data is 
+      transposed so that both dates are values of the same variable.     
+
+   2) All three pieces of data are stacked together to derive the earliest and the 
+      latest administration dates. 
+
+   3) Administration start dates and times are concatenated together so that time 
+      parts are taken into account for further processing.      
+
+   4) End dates are also collected, but since there can be cases when treatment end
+      is not available yet, the latest start date should be used for end date to 
+      indicate the latest administration. 
+
+   5) Finally and SQL procedure is used to derive the earliest and the latest  
+      administration dates per subject. The earliest date marks the start of the 
+      respective randomized treatment element. The latest date will be used at a 
+      later step for Follow-up element.*/
+
+* 1) ;
+
+data sd_pre01;
+  set raw.sd(keep = subjid formeid ec_ecstdat ec_ecsttim ec_ecstdat1 ec_ecsttim1 ec_ecendat
+             rename = (ec_ecstdat = stdat ec_ecsttim = sttim));
+	 if not missing(stdat) then ec_ecstdat = stdat;
+	 if not missing(sttim) then ec_ecsttim = sttim;
+	 output;
+
+	 if not missing(ec_ecstdat1) then ec_ecstdat = put(ec_ecstdat1, is8601da.);
+	 if not missing(ec_ecsttim1) then ec_ecsttim = ec_ecsttim1;
+	 output;
+run;
+ 
+data sd01;
+  * 2) ;
+  set sd_pre01(keep = subjid formeid ec_ecstdat ec_ecsttim)
+      raw.sd_1(keep = subjid formeid ec_ecstdat ec_ecsttim)
+      raw.sd_eos(keep = subjid formeid ec_ecstdat ec_ecendat);
+  
+  length ecstdtc ecendtc $200.;
+
+  * 3) ;
+  if not missing(ec_ecstdat) and not missing(ec_ecsttim) then ecstdtc = catx("T", ec_ecstdat, put(ec_ecsttim, tod5.));
+    else if not missing(ec_ecstdat) and missing(ec_ecsttim) then ecstdtc = ec_ecstdat;
+
+  * 4) ;
+  if not missing(ec_ecendat) then ecendtc = ec_ecendat;
+    else if missing(ec_ecendat) and not missing(ecstdtc) then ecendtc = ecstdtc;
+run;
+
+* 5) ;
+proc sql noprint;
+  create table sd02 as 
+  select distinct subjid, min(ecstdtc) as min_ecstdtc, max(ecendtc) as max_ecendtc 
+  from sd01 
+  group by subjid;
+quit;
+
+* Data processing for the Treatment elements is finished with the above steps. ;
+
+/*********************************************
+               Follow-up
+*********************************************/
+
+/* There are three dates that can possibly indicate the start of Follow-up per study data structure:
+
+   - The last study drug administration date from the SD forms
+   - The 'What is the last known treatment date?' from the DS_EOT form
+   - The Event Date (Visit Date) from the DS_EOT form 
+
+   The latest of the three dates should be regarded as the start of Follow-up. */
+
+
+data ds_eot01;
+  set raw.ds_eot;
+
+  if not missing(eventdt) then ole_start = eventdt;
+  if not missing(ds_dsstdat) then last_known = input(ds_dsstdat, ??is8601da.);
+  format ole_start last_known date9.;
+  
+run;
+
+* To remove duplicates. ;
+
+proc sort data = ds_eot01 out = ds_eot02(keep = subjid ole_start last_known) nodupkey;
+  by subjid;
+run;
+
+* Data processing for the Follow-up element is finished with the above steps. ;
+
+/*****************************************************
+    Combining all individual Subject Elements data
+*****************************************************/
+
+proc sql noprint;
+  create table se01 as
+  select a.subjid length = 15, a.date_of_screening, b.min_ecstdtc, b.max_ecendtc, c.ole_start, c.last_known
+  from screen02 a 
+  left join sd02 b on a.subjid = b.subjid
+  left join ds_eot02 c on a.subjid = c.subjid;
+quit;
+
+* Using HASH Object to merge SDTM.DM with the rest of the SE data ;
+
+data se02;
+  if 4=5 then set sdtm.dm(keep = studyid subjid usubjid rfstdtc rfpendtc actarm actarmcd dthdtc);
+  if _n_ = 1 then do;
+    declare hash dm(dataset: "sdtm.dm");
+    dm.definekey("subjid");
+    dm.definedata("studyid", "subjid", "usubjid", "rfstdtc", "rfpendtc", "actarm", "actarmcd", "dthdtc");
+    dm.definedone();
+  end;
+  set se01;
+  if dm.find(key: subjid) = 0 then output;
+run;
+
+/* ETCD, SESTDTC and SEENDTC variables are created in the following step.
+   While the assignment of SESTDTC values is straightforward, the assignment
+   of SEENDTC relies on the chronological order of lists of date values per element. 
+   The MIN function is used to retrieve the earliest non-missing date from 
+   a list and assign it to SEENDTC per element. */
+
+data se03;
+  set se02;
+
+  length etcd $8. sestdtc seendtc $16. ;
+ 
+  if not missing(dthdtc) then dthdt = input(dthdtc, ??is8601da.);
+  if not missing(min_ecstdtc) then min_ecstdt = input(substr(min_ecstdtc, 1, 10), ??is8601da.);
+  if not missing(max_ecendtc) then max_ecendt = input(substr(max_ecendtc, 1, 10), ??is8601da.);
+
+  * Screening element ;
+  call missing(etcd, sestdtc, seendtc);
+  if not missing(date_of_screening) then do;
+    etcd = "SCRN";
+	sestdtc = strip(put(date_of_screening, is8601da.));
+	seendtc = coalescec(min_ecstdtc, dthdtc, rfpendtc);
+	output;
+  end;
+
+  * Treatment element ;
+  call missing(etcd, sestdtc, seendtc);
+  if not missing(min_ecstdtc) then do;
+    etcd = "TRT";
+	sestdtc = min_ecstdtc;
+	if max_ecendt >= max(0, ole_start, last_known, dthdt) then seendtc = max_ecendtc;
+	  else seendtc = strip(put(max(ole_start, last_known, dthdt), is8601da.));
+	output;
+  end;
+
+  * Follow-up element ;
+  call missing(etcd, sestdtc, seendtc);
+  if nmiss(ole_start, last_known) < 2 then do;
+    etcd = "FUP";
+	if max_ecendt >= max(ole_start, last_known) then sestdtc = max_ecendtc;
+      else sestdtc = strip(put(max(ole_start, last_known), is8601da.));
+	if not missing(rfpendtc) then seendtc = rfpendtc;
+	output;
+  end;
+run;
+
+
+data se04;
+  set se03;
+
+  domain = "SE";
+
+  if cmiss(sestdtc, rfstdtc) = 0 then do;
+    sestdy = input(substr(sestdtc,1,10), is8601da.) - input(substr(rfstdtc,1,10), is8601da.)
+           + (input(substr(sestdtc,1,10), is8601da.) >= input(substr(rfstdtc,1,10), is8601da.));
+  end;
+
+  if cmiss(seendtc, rfstdtc) = 0 then do;
+    seendy = input(substr(seendtc,1,10), is8601da.) - input(substr(rfstdtc,1,10), is8601da.)
+           + (input(substr(seendtc,1,10), is8601da.) >= input(substr(rfstdtc,1,10), is8601da.));
+  end;
+run;
+
+
+* SDTM.TA dataset contains ELEMENT, TAETORD and EPOCH variables. In order to maintain tracability 
+  between SE and TA the mentioned three variables are retrieved from TA instead of manually assigning 
+  the values in the program. ;
+
+proc sql noprint;
+  create table se05 as
+  select se04.studyid, se04.usubjid, . as seseq, se04.domain, se04.etcd, b.element, b.taetord, b.epoch, se04.sestdtc, se04.seendtc, se04.sestdy, se04.seendy
+  from se04 se04
+  left join (select distinct etcd, element, taetord, epoch from sdtm.ta) b on se04.etcd = b.etcd
+  order by usubjid, sestdtc, seendtc;
+quit;
+
+
+data se06;
+  set se05;
+  by usubjid sestdtc seendtc;
+  if first.usubjid then _seseq = 1;
+    else _seseq + 1;
+
+  seseq = _seseq;
+  drop _seseq;
+run;
+
+
+* To assign lengths, labels and variable order according to spec. ;
+
+%prod_attributes(domain = SE, datain = se06, dataout = se07);
+
+data sdtm.se(label = "Subject Elements");
+  set se07;
+run;
+
+%checklog;
+

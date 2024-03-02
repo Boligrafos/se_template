@@ -28,7 +28,7 @@
 
 /* Hayk make sure you implement the OPTIONS VARLENCHK = NOWARN to get read of the name swap part and shorten your code. 
    This is a valuable option that you learned from sasensei. But also remember to close this option at then end so it does 
-   not mess with the code that is outside of the macro. */
+   not mess with the code that is outside of the macro. Which you can do by simply adding OPTIONS VARLENCHK = WARN at the end. */
 
 %macro prod_attributes(domain=,datain=,dataout=);
 

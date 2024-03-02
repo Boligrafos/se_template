@@ -25,6 +25,10 @@
 *             
 ********************************************************************************************************************************************************************;
 
+
+/* Hayk make sure you implement the OPTIONS VARLENCHK = NOWARN to get read of the name swap part and shorten your code. 
+   This is a valuable option that you learned from sasensei. */
+
 %macro prod_attributes(domain=,datain=,dataout=);
 
 %* Importing the spec of the dataset of interest to have accees to the metadata about 
